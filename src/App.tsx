@@ -1,48 +1,69 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import confetti from 'canvas-confetti';
-import { ImageFileItem, ConversionSettings } from './types';
-import { Header } from './components/Header';
-import { DropZone } from './components/DropZone';
-import { ConversionControls } from './components/ConversionControls';
-import { ImageList } from './components/ImageList';
-import { ComparisonModal } from './components/ComparisonModal';
-import { CliCompanionModal } from './components/CliCompanionModal';
-import { processFilesToItems, getImageDimensions, formatBytes } from './utils/fileScanner';
+import React, { useState, useRef, useMemo, useCallback } from 'react';
+import { scanDataTransferItems, getImageDimensions, isJpeFile, isImageFile } from './utils/fileScanner';
 import { convertSingleImage } from './utils/imageConverter';
 import { exportConvertedAsZip, triggerDownload } from './utils/zipExporter';
 import { createSampleJpeFiles } from './utils/sampleImages';
-import { Sparkles, CheckCheck, FolderArchive, ArrowDownToLine } from 'lucide-react';
+import { ImageFileItem } from './types';
+import { Folder, FolderOpen, Download, Copy, Check, RefreshCw } from 'lucide-react';
 
 export default function App() {
+  const [folderName, setFolderName] = useState('input_images');
+  const [outputFolderName, setOutputFolderName] = useState('converted');
+  const [targetFormat, setTargetFormat] = useState<'jpeg' | 'png'>('jpeg');
+  const [onlyJpe, setOnlyJpe] = useState(true);
   const [items, setItems] = useState<ImageFileItem[]>([]);
-  const [settings, setSettings] = useState<ConversionSettings>({
-    targetFormat: 'jpeg',
-    quality: 0.92,
-    matteColor: '#FFFFFF',
-    onlyJpeFiles: false,
-    preserveFolderStructure: true,
-    prefix: '',
-    suffix: '',
-  });
-
   const [isConverting, setIsConverting] = useState(false);
-  const [activeComparisonItem, setActiveComparisonItem] = useState<ImageFileItem | null>(null);
-  const [isCliModalOpen, setIsCliModalOpen] = useState(false);
-  const [isZipping, setIsZipping] = useState(false);
-  const [zipStatusText, setZipStatusText] = useState('');
+  const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState('Ready. Select or drop a folder to start.');
+  const [logs, setLogs] = useState<string[]>([
+    'imgConvert initialized.',
+    'Drop a folder containing images (or click "Browse Folder").',
+  ]);
+  const [isCopied, setIsCopied] = useState(false);
 
-  // Handle addition of raw files (from dropped folder, folder picker, or file picker)
-  const handleFilesSelected = useCallback(async (newFiles: File[]) => {
-    const newItems = await processFilesToItems(newFiles, false);
-    
-    // Add to items list (avoiding duplicate ids)
-    setItems((prev) => {
-      const existingNames = new Set(prev.map((i) => `${i.name}_${i.originalSize}`));
-      const uniqueNew = newItems.filter((i) => !existingNames.has(`${i.name}_${i.originalSize}`));
-      return [...prev, ...uniqueNew];
-    });
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-    // Background dimension resolution
+  const addLog = (msg: string) => {
+    setLogs((prev) => [...prev, msg]);
+  };
+
+  // Filtered items based on "only .jpe files" checkbox
+  const filteredItems = useMemo(() => {
+    if (onlyJpe) {
+      return items.filter((item) => isJpeFile(item.name));
+    }
+    return items.filter((item) => isImageFile(item.name));
+  }, [items, onlyJpe]);
+
+  const completedCount = useMemo(() => {
+    return filteredItems.filter((i) => i.status === 'completed').length;
+  }, [filteredItems]);
+
+  // Load dropped or selected files
+  const handleFiles = useCallback((files: File[], droppedFolder = '') => {
+    if (droppedFolder) {
+      setFolderName(droppedFolder);
+    }
+    const newItems: ImageFileItem[] = files.map((file) => ({
+      id: `${file.name}_${file.size}_${Date.now()}_${Math.random()}`,
+      file,
+      name: file.name,
+      originalExtension: '.' + file.name.split('.').pop()?.toLowerCase(),
+      originalSize: file.size,
+      relativePath: file.webkitRelativePath || file.name,
+      previewUrl: URL.createObjectURL(file),
+      status: 'pending',
+    }));
+
+    setItems(newItems);
+    setProgress(0);
+    const jpeCount = newItems.filter((f) => isJpeFile(f.name)).length;
+    addLog(`\nLoaded ${newItems.length} file(s) from "${droppedFolder || 'input_images'}".`);
+    addLog(`Found ${jpeCount} .jpe file(s) (${newItems.length} total images).`);
+    setStatusMessage(`Loaded ${newItems.length} files. Click "Convert Images" to start.`);
+
+    // Load dimensions quietly
     newItems.forEach(async (item) => {
       const dims = await getImageDimensions(item.file);
       setItems((prev) =>
@@ -51,314 +72,377 @@ export default function App() {
     });
   }, []);
 
-  // Quick load of sample .jpe files
-  const handleLoadSamples = useCallback(async () => {
-    try {
-      const sampleFiles = await createSampleJpeFiles();
-      await handleFilesSelected(sampleFiles);
-    } catch (err) {
-      console.error('Failed to load sample images:', err);
-    }
-  }, [handleFilesSelected]);
+  // Drag and drop handler
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
 
-  // Counts & stats
-  const jpeOnlyCount = useMemo(() => {
-    return items.filter((i) => i.name.toLowerCase().endsWith('.jpe')).length;
-  }, [items]);
-
-  const activeItems = useMemo(() => {
-    return settings.onlyJpeFiles
-      ? items.filter((i) => i.name.toLowerCase().endsWith('.jpe'))
-      : items;
-  }, [items, settings.onlyJpeFiles]);
-
-  const completedCount = useMemo(() => {
-    return activeItems.filter((i) => i.status === 'completed').length;
-  }, [activeItems]);
-
-  const progressPercent = useMemo(() => {
-    if (activeItems.length === 0) return 0;
-    return Math.round((completedCount / activeItems.length) * 100);
-  }, [completedCount, activeItems.length]);
-
-  // Overall statistics for converted files
-  const conversionStats = useMemo(() => {
-    const completed = activeItems.filter((i) => i.status === 'completed' && i.outputSize);
-    const origBytes = completed.reduce((acc, i) => acc + i.originalSize, 0);
-    const outBytes = completed.reduce((acc, i) => acc + (i.outputSize || 0), 0);
-    const savedBytes = origBytes - outBytes;
-    return {
-      completedCount: completed.length,
-      origBytes,
-      outBytes,
-      savedBytes,
-    };
-  }, [activeItems]);
-
-  // Remove single item
-  const handleRemoveItem = useCallback((id: string) => {
-    setItems((prev) => prev.filter((item) => item.id !== id));
-  }, []);
-
-  // Reset queue
-  const handleClear = useCallback(() => {
-    setItems([]);
-  }, []);
-
-  // Batch Conversion Engine
-  const handleStartConversion = async () => {
-    if (activeItems.length === 0 || isConverting) return;
-
-    setIsConverting(true);
-
-    // Reset status of active items to pending if re-running
-    setItems((prev) =>
-      prev.map((item) => {
-        const matchesFilter = !settings.onlyJpeFiles || item.name.toLowerCase().endsWith('.jpe');
-        if (matchesFilter) {
-          return { ...item, status: 'pending', errorMessage: undefined };
+    if (e.dataTransfer && e.dataTransfer.items) {
+      try {
+        const files = await scanDataTransferItems(e.dataTransfer.items);
+        let extractedFolderName = 'input_images';
+        if (files[0] && files[0].webkitRelativePath) {
+          const parts = files[0].webkitRelativePath.split('/');
+          if (parts.length > 1) extractedFolderName = parts[0];
         }
-        return item;
-      })
-    );
-
-    const itemsToProcess = [...activeItems];
-    let successCount = 0;
-
-    for (let i = 0; i < itemsToProcess.length; i++) {
-      const currentItem = itemsToProcess[i];
-
-      // Mark current as processing
-      setItems((prev) =>
-        prev.map((item) => (item.id === currentItem.id ? { ...item, status: 'processing' } : item))
-      );
-
-      try {
-        const result = await convertSingleImage(currentItem, settings);
-        successCount++;
-
-        // Update item with result
-        setItems((prev) =>
-          prev.map((item) =>
-            item.id === currentItem.id
-              ? {
-                  ...item,
-                  status: 'completed',
-                  outputBlob: result.blob,
-                  outputUrl: result.url,
-                  outputSize: result.size,
-                  outputName: result.outputName,
-                  outputFormat: settings.targetFormat,
-                  width: result.width,
-                  height: result.height,
-                  convertedAt: Date.now(),
-                }
-              : item
-          )
-        );
-      } catch (err: any) {
-        console.error(`Error converting ${currentItem.name}:`, err);
-        setItems((prev) =>
-          prev.map((item) =>
-            item.id === currentItem.id
-              ? {
-                  ...item,
-                  status: 'error',
-                  errorMessage: err?.message || 'Conversion failed',
-                }
-              : item
-          )
-        );
+        handleFiles(files, extractedFolderName);
+      } catch (err) {
+        addLog(`Error scanning dropped folder: ${err}`);
       }
-    }
-
-    setIsConverting(false);
-
-    // Trigger celebratory confetti if any converted
-    if (successCount > 0) {
-      try {
-        confetti({
-          particleCount: 50,
-          spread: 60,
-          origin: { y: 0.8 },
-          colors: ['#6366f1', '#38bdf8', '#10b981'],
-        });
-      } catch {
-        // Safe fallback
-      }
+    } else if (e.dataTransfer.files) {
+      handleFiles(Array.from(e.dataTransfer.files));
     }
   };
 
-  // Download all as ZIP (mimics the converted/ output folder)
-  const handleDownloadZip = async () => {
-    const completedItems = activeItems.filter((i) => i.status === 'completed' && i.outputBlob);
-    if (completedItems.length === 0) return;
+  // Load sample test files
+  const handleLoadSamples = async () => {
+    try {
+      const sampleFiles = await createSampleJpeFiles();
+      handleFiles(sampleFiles, 'input_images');
+    } catch (err) {
+      addLog(`Failed to load samples: ${err}`);
+    }
+  };
 
-    setIsZipping(true);
-    setZipStatusText('Preparing ZIP archive...');
+  // Start conversion
+  const handleStartConversion = async () => {
+    if (filteredItems.length === 0 || isConverting) return;
+
+    setIsConverting(true);
+    setProgress(0);
+    const targetExt = targetFormat === 'jpeg' ? 'JPG' : 'PNG';
+    addLog(`\nStarting conversion to .${targetExt}...`);
+
+    let successCount = 0;
+    const total = filteredItems.length;
+
+    for (let i = 0; i < total; i++) {
+      const item = filteredItems[i];
+      setItems((prev) =>
+        prev.map((f) => (f.id === item.id ? { ...f, status: 'processing' } : f))
+      );
+
+      try {
+        const res = await convertSingleImage(item, {
+          targetFormat,
+          quality: 0.95,
+          matteColor: '#FFFFFF',
+          onlyJpeFiles: onlyJpe,
+          preserveFolderStructure: false,
+          prefix: '',
+          suffix: '',
+        });
+
+        successCount++;
+        setItems((prev) =>
+          prev.map((f) =>
+            f.id === item.id
+              ? {
+                  ...f,
+                  status: 'completed',
+                  outputBlob: res.blob,
+                  outputUrl: res.url,
+                  outputSize: res.size,
+                  outputName: res.outputName,
+                  width: res.width,
+                  height: res.height,
+                }
+              : f
+          )
+        );
+        addLog(`  [✓] ${item.name} -> ${res.outputName}`);
+      } catch (err: any) {
+        addLog(`  [✗] Error converting ${item.name}: ${err?.message || err}`);
+        setItems((prev) =>
+          prev.map((f) =>
+            f.id === item.id ? { ...f, status: 'error', errorMessage: String(err) } : f
+          )
+        );
+      }
+
+      const pct = Math.round(((i + 1) / total) * 100);
+      setProgress(pct);
+      setStatusMessage(`Converting ${i + 1} of ${total} files (${pct}%)...`);
+    }
+
+    setIsConverting(false);
+    addLog(`\nFinished! Converted ${successCount}/${total} images.`);
+    addLog(`Ready to save in "${outputFolderName}/" folder.`);
+    setStatusMessage(`Done! Converted ${successCount}/${total} images.`);
+  };
+
+  // Download ZIP
+  const handleDownloadZip = async () => {
+    const readyItems = filteredItems.filter((i) => i.status === 'completed' && i.outputBlob);
+    if (readyItems.length === 0) return;
 
     try {
-      const zipBlob = await exportConvertedAsZip(completedItems, (pct, status) => {
-        setZipStatusText(`${status} (${pct}%)`);
-      });
-
-      triggerDownload(zipBlob, `converted_${settings.targetFormat}.zip`);
+      const zipBlob = await exportConvertedAsZip(readyItems);
+      triggerDownload(zipBlob, `${outputFolderName}.zip`);
+      addLog(`Downloaded "${outputFolderName}.zip" with ${readyItems.length} images.`);
     } catch (err) {
-      console.error('ZIP generation failed:', err);
-    } finally {
-      setIsZipping(false);
-      setZipStatusText('');
+      addLog(`Failed to create ZIP: ${err}`);
+    }
+  };
+
+  // Copy Python code
+  const handleCopyPython = async () => {
+    try {
+      const res = await fetch('/gui_app.py');
+      const text = await res.text();
+      await navigator.clipboard.writeText(text);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch {
+      alert('Could not copy automatically. Check gui_app.py in project root.');
     }
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      {/* 3-Zone Navigation Header */}
-      <Header
-        onOpenCliModal={() => setIsCliModalOpen(true)}
-        onLoadSamples={handleLoadSamples}
-        totalCount={activeItems.length}
+    <div className="min-h-screen bg-slate-200 text-slate-800 p-4 sm:p-8 flex items-center justify-center font-sans">
+      {/* Hidden file inputs */}
+      <input
+        ref={folderInputRef}
+        type="file"
+        // @ts-expect-error webkitdirectory is standard for folder picker in modern browsers
+        webkitdirectory="true"
+        directory="true"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            const files = Array.from(e.target.files);
+            let name = 'input_images';
+            if (files[0].webkitRelativePath) {
+              name = files[0].webkitRelativePath.split('/')[0];
+            }
+            handleFiles(files, name);
+            e.target.value = '';
+          }
+        }}
+      />
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept=".jpe,.jpg,.jpeg,.png,.webp,image/*"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            handleFiles(Array.from(e.target.files));
+            e.target.value = '';
+          }
+        }}
       />
 
-      {/* Main Content Area */}
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-8 flex flex-col gap-6">
+      {/* Main Standard Desktop Box */}
+      <div className="w-full max-w-2xl bg-white border border-slate-300 rounded shadow-md overflow-hidden flex flex-col">
         
-        {/* Hero Banner / Introductory Context */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-900">
-          <div>
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white">
-              Batch Image &amp; JPE Converter
-            </h1>
-            <p className="text-sm text-slate-400 mt-1">
-              Drop an entire folder of <span className="text-indigo-300 font-mono">.jpe</span> or standard images, select target format, and convert in one click.
-            </p>
+        {/* Title Bar */}
+        <div className="bg-slate-100 border-b border-slate-300 px-4 py-2.5 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Folder className="w-4 h-4 text-slate-600" />
+            <span className="font-semibold text-sm text-slate-900">imgConvert</span>
+            <span className="text-xs text-slate-500">· Batch Image Converter</span>
           </div>
-
-          <div className="flex items-center gap-2 self-start sm:self-auto">
-            <span className="text-xs text-slate-400 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-lg font-mono">
-              Zero-upload · 100% Client-Side Canvas
-            </span>
-          </div>
+          <button
+            type="button"
+            onClick={handleCopyPython}
+            className="text-xs text-slate-600 hover:text-slate-900 border border-slate-300 bg-white hover:bg-slate-50 px-2 py-1 rounded transition-colors flex items-center gap-1"
+            title="Copy simple Python code for Visual Studio"
+          >
+            {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{isCopied ? 'Copied Python code' : 'Copy Python code'}</span>
+          </button>
         </div>
 
-        {/* 1. Drop Zone */}
-        <DropZone
-          onFilesSelected={handleFilesSelected}
-          onLoadSamples={handleLoadSamples}
-          isProcessing={isConverting}
-          totalLoaded={items.length}
-        />
-
-        {/* 2. Conversion Settings & Start Bar */}
-        <ConversionControls
-          settings={settings}
-          onSettingsChange={setSettings}
-          onStartConversion={handleStartConversion}
-          onDownloadZip={handleDownloadZip}
-          onClear={handleClear}
-          isConverting={isConverting}
-          progressPercent={progressPercent}
-          totalCount={items.length}
-          completedCount={completedCount}
-          jpeOnlyCount={jpeOnlyCount}
-        />
-
-        {/* 3. Conversion Summary Strip (if items completed) */}
-        {completedCount > 0 && (
-          <div className="w-full bg-emerald-950/20 border border-emerald-800/30 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4 text-xs">
-            <div className="flex items-center gap-3">
-              <div className="w-7 h-7 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
-                <CheckCheck className="w-4 h-4" />
-              </div>
-              <div className="flex flex-col">
-                <span className="font-semibold text-emerald-300">
-                  Batch Conversion Complete: {completedCount} of {activeItems.length} files converted
-                </span>
-                <span className="text-slate-400 font-mono">
-                  Original: {formatBytes(conversionStats.origBytes)} &rarr; Output: {formatBytes(conversionStats.outBytes)}
-                  {conversionStats.savedBytes > 0 && (
-                    <span className="text-emerald-400 ml-1.5">
-                      (Saved {formatBytes(conversionStats.savedBytes)})
-                    </span>
-                  )}
-                </span>
-              </div>
+        {/* Content Body */}
+        <div className="p-5 flex flex-col gap-4 text-sm">
+          
+          {/* 1. Input Folder */}
+          <div className="border border-slate-300 rounded p-3 bg-slate-50">
+            <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase tracking-wide">
+              Input Folder
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={folderName}
+                onChange={(e) => setFolderName(e.target.value)}
+                className="flex-1 bg-white border border-slate-300 rounded px-3 py-1.5 text-sm text-slate-800 focus:outline-none focus:border-slate-500 font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => folderInputRef.current?.click()}
+                className="bg-slate-100 hover:bg-slate-200 border border-slate-300 text-slate-700 px-3 py-1.5 rounded text-xs font-medium transition-colors whitespace-nowrap"
+              >
+                Browse Folder...
+              </button>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="bg-slate-100 hover:bg-slate-200 border border-slate-300 text-slate-700 px-3 py-1.5 rounded text-xs font-medium transition-colors whitespace-nowrap"
+              >
+                Browse Files...
+              </button>
             </div>
 
-            <div className="flex items-center gap-3">
+            {/* Simple Drag & Drop target inside input card */}
+            <div
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={handleDrop}
+              onClick={() => folderInputRef.current?.click()}
+              className="mt-2.5 border border-dashed border-slate-300 rounded bg-white hover:bg-slate-50 p-3 text-center cursor-pointer transition-colors"
+            >
+              <p className="text-xs text-slate-500">
+                Or drag &amp; drop your <strong className="text-slate-700">input_images</strong> folder directly here
+              </p>
+              {items.length === 0 && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleLoadSamples();
+                  }}
+                  className="mt-1.5 text-xs text-indigo-600 hover:underline font-medium"
+                >
+                  Click here to load 4 test .jpe files
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 2. Output Folder */}
+          <div className="border border-slate-300 rounded p-3 bg-slate-50">
+            <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase tracking-wide">
+              Output Folder
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={outputFolderName}
+                onChange={(e) => setOutputFolderName(e.target.value)}
+                className="flex-1 bg-white border border-slate-300 rounded px-3 py-1.5 text-sm text-slate-800 focus:outline-none focus:border-slate-500 font-mono"
+              />
+            </div>
+          </div>
+
+          {/* 3. Conversion Options */}
+          <div className="border border-slate-300 rounded p-3 bg-slate-50 flex flex-col gap-2">
+            <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wide">
+              Conversion Options
+            </label>
+            <div className="flex items-center gap-6">
+              <span className="text-xs text-slate-600">Target Format:</span>
+              <label className="flex items-center gap-1.5 text-xs text-slate-800 cursor-pointer">
+                <input
+                  type="radio"
+                  name="format"
+                  checked={targetFormat === 'jpeg'}
+                  onChange={() => setTargetFormat('jpeg')}
+                />
+                <span>JPG</span>
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-slate-800 cursor-pointer">
+                <input
+                  type="radio"
+                  name="format"
+                  checked={targetFormat === 'png'}
+                  onChange={() => setTargetFormat('png')}
+                />
+                <span>PNG</span>
+              </label>
+            </div>
+
+            <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer mt-1">
+              <input
+                type="checkbox"
+                checked={onlyJpe}
+                onChange={(e) => setOnlyJpe(e.target.checked)}
+              />
+              <span>Convert only <code className="bg-slate-200 px-1 rounded text-slate-800">.jpe</code> files (ignore other formats in folder)</span>
+            </label>
+          </div>
+
+          {/* 4. Action Buttons */}
+          <div className="flex items-center gap-3 pt-1">
+            <button
+              type="button"
+              onClick={handleStartConversion}
+              disabled={isConverting || filteredItems.length === 0}
+              className={`px-5 py-2 text-sm font-semibold rounded shadow-sm transition-colors ${
+                filteredItems.length === 0
+                  ? 'bg-slate-200 text-slate-400 border border-slate-300 cursor-not-allowed'
+                  : isConverting
+                  ? 'bg-slate-300 text-slate-600 cursor-wait'
+                  : 'bg-slate-800 hover:bg-slate-900 text-white cursor-pointer'
+              }`}
+            >
+              {isConverting ? 'Converting...' : `Convert Images (${filteredItems.length})`}
+            </button>
+
+            {completedCount > 0 && (
               <button
                 type="button"
                 onClick={handleDownloadZip}
-                disabled={isZipping}
-                className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 rounded-lg shadow-sm transition-all flex items-center gap-2 whitespace-nowrap"
+                className="px-4 py-2 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded shadow-sm transition-colors flex items-center gap-1.5"
               >
-                {isZipping ? (
-                  <>
-                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    <span>{zipStatusText || 'Creating ZIP...'}</span>
-                  </>
-                ) : (
-                  <>
-                    <FolderArchive className="w-3.5 h-3.5" />
-                    <span>Download converted.zip</span>
-                  </>
-                )}
+                <Download className="w-4 h-4" />
+                Download {outputFolderName}.zip ({completedCount})
               </button>
-            </div>
-          </div>
-        )}
+            )}
 
-        {/* 4. Batch Queue & Image List */}
-        <section id="queue" className="flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <h2 className="text-base font-semibold text-white">Conversion Queue</h2>
-              <span className="text-xs font-mono text-slate-500">
-                ({activeItems.length} {activeItems.length === 1 ? 'file' : 'files'})
-              </span>
-            </div>
-
-            {completedCount > 0 && (
-              <span className="text-xs text-slate-400">
-                Click <span className="text-indigo-300">eye icon</span> to compare before/after
-              </span>
+            {items.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setItems([]);
+                  setProgress(0);
+                  setStatusMessage('Cleared. Drop or select a folder.');
+                  addLog('Queue cleared.');
+                }}
+                disabled={isConverting}
+                className="px-3 py-2 text-xs text-slate-600 hover:text-slate-900 border border-slate-300 hover:bg-slate-100 rounded transition-colors ml-auto"
+              >
+                Clear
+              </button>
             )}
           </div>
 
-          <ImageList
-            items={items}
-            onlyJpeFiles={settings.onlyJpeFiles}
-            onRemoveItem={handleRemoveItem}
-            onCompareItem={(item) => setActiveComparisonItem(item)}
-            targetFormat={settings.targetFormat}
-          />
-        </section>
+          {/* 5. Progress Bar & Status */}
+          <div className="flex flex-col gap-1">
+            <div className="w-full bg-slate-200 rounded h-2 overflow-hidden border border-slate-300">
+              <div
+                className="bg-slate-700 h-full transition-all duration-150"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+            <span className="text-xs text-slate-600 font-mono">{statusMessage}</span>
+          </div>
 
-      </main>
+          {/* 6. Status Log Box */}
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide">
+              Status Log
+            </label>
+            <div className="bg-slate-900 text-slate-200 font-mono text-xs p-3 rounded h-40 overflow-y-auto leading-relaxed border border-slate-300 select-text">
+              {logs.map((line, idx) => (
+                <div key={idx} className="whitespace-pre-wrap">
+                  {line}
+                </div>
+              ))}
+            </div>
+          </div>
 
-      {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950/80 px-6 py-6 text-center text-xs text-slate-500">
-        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-          <p>
-            imgConvert &bull; Drop folder &amp; batch image conversion engine
-          </p>
-          <p className="font-mono text-slate-600 text-[11px]">
-            Input: <code className="text-slate-400">input_images/</code> &bull; Output: <code className="text-slate-400">converted/</code>
-          </p>
         </div>
-      </footer>
 
-      {/* Comparison Modal (Side-by-side / split slider) */}
-      <ComparisonModal
-        item={activeComparisonItem}
-        onClose={() => setActiveComparisonItem(null)}
-      />
+        {/* Footer */}
+        <div className="bg-slate-100 border-t border-slate-200 px-4 py-2 text-xs text-slate-500 flex items-center justify-between">
+          <span>imgConvert · Local execution</span>
+          <span className="font-mono text-[11px] text-slate-400">100% Client-Side · No uploads</span>
+        </div>
 
-      {/* Python CLI companion modal */}
-      <CliCompanionModal
-        isOpen={isCliModalOpen}
-        onClose={() => setIsCliModalOpen(false)}
-      />
+      </div>
     </div>
   );
 }
