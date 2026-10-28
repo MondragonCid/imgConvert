@@ -1,0 +1,6 @@
+{
+  "name": "imgConvert - Batch Image & JPE Converter",
+  "description": "Drop folders or files to batch convert JPE, JPG, and PNG images with instant browser-based processing, quality controls, and ZIP export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
